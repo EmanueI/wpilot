@@ -246,7 +246,7 @@ function start_gameserver(options, state) {
    *  @return {undefined} Nothing
    */
   function post_state_updates(t, dt) {
-    if (t % dt * update_rate) {
+    if (parseInt(t * 1000) % update_rate == 0) {
       world.each_uncommited(function(item) {
         var connection = null;
         if (item.player) {
@@ -258,7 +258,7 @@ function start_gameserver(options, state) {
         }
         item.commit();
       });
-    }
+    } 
   }
   
   /**
@@ -498,9 +498,9 @@ function start_gameserver(options, state) {
       player.events.addListener('state_changed', function(state) {
         switch (state) {
           case OK:
+            broadcast_exclude(conn, [PLAYER + CONNECT, player.repr()]);
             player.spawn_ship(world.find_respawn_pos());
             log(conn + ' joined the game.');
-            broadcast_exclude(conn, [PLAYER + CONNECT, player.repr()]);
             break;
         }
       });

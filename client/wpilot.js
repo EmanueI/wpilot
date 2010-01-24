@@ -164,7 +164,7 @@ WPilotClient.prototype.set_viewport = function(viewport) {
       self.world.draw(viewport);
       self.draw_hud();
     }
-    self.draw_message_log();
+    self.draw_logs();
   }
   this.viewport = viewport;
 }
@@ -293,12 +293,6 @@ WPilotClient.prototype.start_gameloop = function(initial_tick) {
     viewport.refresh(alpha);
   }
 
-  // self.gameloop.loop_callback = function(t, step, alpha) {
-  //     var curtime = new Date().getTime();
-  //     session.env.cur_sps = parseInt(1000 / ((curtime - session.world.start_time) / (t / step)));  
-  //     session.draw(session, alpha);
-  //   }
-  // }
   this.viewport.set_autorefresh(false);
   this.netstat.start_time = this.netstat.last_update = get_time();
   gameloop.start();
@@ -400,11 +394,11 @@ WPilotClient.prototype.post = function(msg) {
 }
 
 /**
- *  Draws the message log.
+ *  Draws logs, which includes the message log, netstat log and fps counter.
  *  @param {String} msg The message that should be sent.
  *  @return {undefined} Nothing
  */
-WPilotClient.prototype.draw_message_log = function() {
+WPilotClient.prototype.draw_logs = function() {
   var ctx             = this.viewport.ctx,
       log             = this.message_log,
       log_index       = log.length,
@@ -437,6 +431,12 @@ WPilotClient.prototype.draw_message_log = function() {
     var text = 'Netstat: in: ' + in_kps + 'kb/s, out: ' + out_kps + 'kb/s, ' +
                'in: ' + in_mps + '/mps, out: ' + out_mps + '/mps';
     draw_label(ctx, 6, 12, text, 'left');
+  }
+  
+  if (this.options.show_fps) {
+    ctx.font = LOG_FONT;
+    ctx.fillStyle = LOG_COLOR;
+    draw_label(ctx, this.viewport.w - 6, 12, 'FPS count: ' + parseInt(this.viewport.average_fps), 'right');
   }
 }
 
@@ -713,11 +713,6 @@ Viewport.prototype.draw = function() {
   ctx.save();
   ctx.translate(0, 0);
   this.ondraw(ctx);
-  if (this.options.show_fps) {
-    ctx.font = LOG_FONT;
-    ctx.fillStyle = LOG_COLOR;
-    draw_label(ctx, this.w - 6, 12, 'FPS count: ' + parseInt(this.average_fps), 'right');
-  }
   ctx.restore();
 }
 
@@ -745,11 +740,11 @@ var PROCESS_MESSAGE = Match (
   function(player_id, tick, world_data, entities, players, client) {
     var world = new World(world_data);
     client.world = world;
-    for (var i = 0; i < entities.length; i++) {
-      PROCESS_MESSAGE([[ENTITY + SPAWN, entities[i]], client]);
-    }
     for (var i = 0; i < players.length; i++) {
       world.players[players[i].id] = new Player(players[i]);
+    }
+    for (var i = 0; i < entities.length; i++) {
+      PROCESS_MESSAGE([[ENTITY + SPAWN, entities[i]], client]);
     }
     client.server_state.no_players++
     client.set_world(world);
@@ -850,8 +845,8 @@ var PROCESS_MESSAGE = Match (
   [[ENTITY + SPAWN, {'type =': SHIP}], _],
   function(data, client) {
     var entity = new Ship(data);
-    // session.world.players[entity.pid] = entity;
     client.world.append(entity);
+    entity.player = client.world.players[entity.pid];
   },
 
   /**
@@ -1002,6 +997,7 @@ Ship.prototype.before_init = function() {
   this.visible = true;
   this.is_me = false;
   this.shield_pulse_alpha = 0.3;
+  this.player = null;
 }
 
 /**
@@ -1018,7 +1014,7 @@ Ship.prototype.draw = function(ctx) {
   ctx.lineTo(-(this.w / 2), this.h);
   ctx.lineTo(0, -this.h);
   ctx.fill();
-  if(this.sd) {
+  if (this.sd) {
     ctx.beginPath();
     var alpha = Math.abs(Math.sin((this.shield_pulse_alpha += 0.06)));
     if (alpha < 0.3) alpha = 0.3;
