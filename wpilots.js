@@ -18,7 +18,7 @@ var _         = match.incl;
 
 process.mixin(require('./lib/gameobjects'));
 
-const SERVER_VERSION       = '0.5.1';
+const SERVER_VERSION       = '(develop version)';
 
 const RE_POLICY_REQ = /<\s*policy\-file\-request\s*\/>/i,
       POLICY_RES    = "<cross-domain-policy><allow-access-from domain=\"*\" to-ports=\"*\" /></cross-domain-policy>";
@@ -53,7 +53,11 @@ const SWITCHES = [
   ['--r_reload_time NUMBER',      'Rule: The reload time after fire. (Default: 15)'],
   ['--r_shoot_cost NUMBER',       'Rule: Energy cost of shooting a bullet. (Default: 800)'],
   ['--r_shield_cost NUMBER',      'Rule: Energy cost of using the shield. (Default: 70)'],
-  ['--r_energy_recovery NUMBER',  'Rule: Energy recovery unit (Default: 40)']
+  ['--r_energy_recovery NUMBER',  'Rule: Energy recovery unit (Default: 40)'],
+  ['--r_round_limit NUMBER',      'Rule: Round score limit (Default: 10)'],
+  ['--r_round_rs_time NUMBER',    'Rule: Restart time after round finished (Default: 600)'],
+  ['--r_penelty_score NUMBER',    'Rule: The cost of suicides (Default: 1)'],
+  ['--r_kill_score NUMBER',       'Rule: The price of a kill (Default: 1)']
 ];
 
 // Default server options
@@ -71,12 +75,16 @@ const DEFAULT_OPTIONS = {
   world_width:          1000,
   world_height:         1000,
   update_rate:          10,
-  r_start_delay:        300,
-  r_respawn_time:       500,
+  r_start_delay:        200,
+  r_respawn_time:       400,
   r_reload_time:        15,
-  r_shoot_cost:         800,
+  r_shoot_cost:         300,
   r_shield_cost:        70,
-  r_energy_recovery:    40
+  r_energy_recovery:    40,
+  r_round_limit:        10,
+  r_round_rs_time:      600,
+  r_penelty_score:      1,
+  r_kill_score:         1
 };
 
 // Paths to all files that should be server to client.
@@ -97,7 +105,18 @@ const CLIENT_DATA = [
 
 // Player colors
 const PLAYER_COLORS = [
-  '0xFFFFFF' 
+  '255, 176,  0',
+  '51,  182,  255',
+  '172, 48,   224',
+  '230, 21,   90',
+  '166, 219,  0',
+  '125, 142,  22',
+  '244, 52,   0',
+  '199, 244,  136',
+  '227, 111,  160',
+  '63,  140,  227',
+  '227, 126,  76',
+  '134, 213,  227'
 ];
 
 // Player names
@@ -158,6 +177,7 @@ function start_gameserver(options, state) {
                             (options.pub_ws_port || options.ws_port) + '/';
   state.max_players       = options.max_players;
   state.no_players        = 0;
+  state.no_ready_players  = 0;
   state.update_rate       = options.update_rate;
   state.flash_compatible  = options.serve_flash_policy;
   state.world_width       = options.world_width;
@@ -174,6 +194,7 @@ function start_gameserver(options, state) {
     do_game_logic(t, dt);
     world.step(t, dt);
     check_collisions(t, dt);
+    check_rules(t, dt);
     post_state_updates(t, dt);
     flush_queues();
   }
@@ -209,6 +230,8 @@ function start_gameserver(options, state) {
     for (var id in connections) {
       connections[id].kill('Server is shutting down')
     }
+    
+    world.r_state = 'waiting';
 
     gameloop.kill();
     gameloop = null;
@@ -258,10 +281,14 @@ function start_gameserver(options, state) {
           } else {
             broadcast([item._subject + STATE, item.id, item.changed_values()]);
           }
+          item.commit();
         }
-        item.commit();
       });
-    } 
+    }
+    if (world.is_changed('round')) {
+      broadcast([WORLD + STATE, world.changed_values()]);
+      world.commit();
+    }
   }
   
   /**
@@ -291,11 +318,15 @@ function start_gameserver(options, state) {
       }
     
       if (player.is_dead && !player.respawn_time) {
-        player.respawn_time = t + rules.respawn_time * dt;
+        if (world.r_state == 'running') {
+          player.respawn_time = t + rules.respawn_time * dt;
+        } else {
+          player.respawn_time = t + 10 * dt;
+        }
       }
 
       if (player.entity) {
-        var entity = player.entity, recover_energy = true;
+        var entity = player.entity;
 
         entity.update_field(THRUST, player[THRUST]);
         entity.update_field(ROTATE, player[ROTATE]);
@@ -304,7 +335,6 @@ function start_gameserver(options, state) {
           player.update({
             e: player.e - rules.shield_cost * dt
           });
-          recover_energy = false;
           entity.update_field(SHIELD, 1);
         } else {
           entity.update_field(SHIELD, 0);
@@ -321,17 +351,112 @@ function start_gameserver(options, state) {
           });
           player.reload_time = t + rules.reload_time * dt;
           player.spawn_bullet();
-          recover_energy = false;
         } else {
           entity.update_field(SHOOT, 0);
         }
         
-        if (player.e <= 100 && recover_energy) {
+        if (player.e <= 100 && !player[SHIELD] && !player[SHOOT]) {
           player.update({
             e: player.e + rules.energy_recovery * dt
           });
         }
       }
+    }
+  }
+  
+  /**
+   *  Check game rules 
+   *  @param {Number} t Current world time.
+   *  @param {Number} dt Current delta time,
+   *  @return {undefined} Nothing
+   */
+  function check_rules(t, dt) {
+    switch (world.r_state) {
+      
+      // The world is waiting for players to be "ready". The game starts when 
+      // 60% of the players are ready.
+      case 'waiting':
+        if (state.no_players > 1 && state.no_ready_players >= (state.no_players * 0.6)) {
+          world.update({
+            r_state: 'starting',
+            r_start_at: t + rules.start_delay * dt
+          });
+          world.each('players', function(player) {
+            if (player.entity) {
+              world.delete_by_id(player.entity.id);
+              broadcast([ENTITY + DESTROY, player.entity.id]);
+            }
+          });
+        }
+        break;
+        
+      // Round is starting. Server aborts if a player leaves the game.
+      case 'starting':
+        if (state.no_ready_players < (state.no_players * 0.6)) {
+          world.update({
+            r_state: 'waiting',
+            r_start_at: 0
+          });
+          world.each('players', function(player) {
+            player.spawn_ship(world.find_respawn_pos());
+          });
+          return;
+        }
+        if (t >= world.r_start_at) {
+          world.update({
+            r_state: 'running',
+            r_start_at: 0
+          });
+          world.each('players', function(player) {
+            player.update({st: 0, s: 0});
+            player.spawn_ship(world.find_respawn_pos());
+          });
+          state.no_ready_players = 0;
+        }
+        break;
+        
+      // The round is running. Wait for a winner.
+      case 'running':
+        var winners = [];
+        world.each('players', function(player) {
+          if (player.s == rules.round_limit) {
+            winners.push(player.id);
+          }
+        });
+        if (winners.length) {
+          world.update({
+            r_state: 'finished',
+            r_restart_at: t + rules.round_rs_time * dt,
+            r_winners: winners
+          });
+          world.each('players', function(player) {
+            if (player.entity) {
+              world.delete_by_id(player.entity.id);
+              broadcast([ENTITY + DESTROY, player.entity.id]);
+            }
+            player.is_dead = false;
+            player.respawn_time = 0;
+          });
+        }
+        break;
+
+      // The round is finished. Wait for restart
+      case 'finished':
+        if (t >= world.r_restart_at) {
+          world.update({
+            r_state: 'waiting',
+            r_restart_at: 0,
+            r_winners: []
+          });
+          world.each('players', function(player) {
+            player.update({
+              s: 0,
+              e: 100
+            });
+            player.spawn_ship(world.find_respawn_pos());
+          });
+        }
+        break;
     }
   }
   
@@ -508,8 +633,23 @@ function start_gameserver(options, state) {
         }
       });
       
-      player.events.addListener('dead', function(death_cause, killer_id) {
-        broadcast([PLAYER + DESTROY, player.id, death_cause, killer_id]);
+      player.events.addListener('ready', function() {
+        if (world.r_state == 'waiting') {
+          state.no_ready_players = state.no_ready_players + 1;
+          broadcast([PLAYER + READY, player.id]);
+        }
+      });
+      
+      player.events.addListener('dead', function(death_cause, killer) {
+        switch (death_cause) {
+          case DEATH_CAUSE_SUICDE:
+            player.update_field('s', player.s - rules.penelty_score < 0 ? 0 : player.s - rules.penelty_score);
+            break;
+          case DEATH_CAUSE_KILLED:
+            killer.update_field('s', killer.s + rules.kill_score);
+            break;
+        }
+        broadcast([PLAYER + DESTROY, player.id, death_cause, killer ? killer.id : -1]);
       });
 
       world.players[connection_id] = player;
@@ -533,6 +673,7 @@ function start_gameserver(options, state) {
           delete world.players[connection_id];
 
           state.no_players = state.no_players - 1;
+          state.no_ready_players = state.no_ready_players - 1;
 
           if (state.no_players == 0) {
             stop_gameloop();
@@ -560,14 +701,19 @@ function start_gameserver(options, state) {
  */
 var PROCESS_MESSAGE = match (
 
-  //
-  //  Message CLIENT CONNECT 
-  //
-  //  MUST be sent by the client when connected to server. It's used to validate
-  //  the session.
-  //
+  /**
+   *  MUST be sent by the client when connected to server. It's used to validate
+   *  the session.
+   */
   [[CLIENT + CONNECT], {'is_game_conn =': true}], function(conn) {
     conn.emit('client-join');
+  },
+  
+  /**
+   *  Client has received world data. Client is now a player of the world.
+   */
+  [[CLIENT + HANDSHAKE], {'state =': CONNECTING}], function(player) {
+    player.set_state(OK);
   },
 
   /**
@@ -602,32 +748,13 @@ var PROCESS_MESSAGE = match (
     player[SHIELD] = value;
   },
 
-  //
-  //  Message PLAYER HANDSHAKE
-  //
-  //  Is recived when client has downloaded world state. A player ship is 
-  //  spawned into the world.
-  //
-  [[PLAYER + HANDSHAKE], {'state =': CONNECTING}], function(player) {
-    player.set_state(OK);
-  },
-
   /**
-   * PLAYER READY
-   * Indicates that the player is ready for some action.  
-   *
-   * The game is automaticly started if 60% of the players are ready.
+   *  Indicates that player is ready to start the round
    */
-  [[PLAYER + READY], _], function(session) {
-    var world = game.world;
-    var player = session.player;
-
-    // Set player state to ´´ready´´
-    player.update({ st: READY });
-
-    if(world.no_players / world.max_players >= 0.6) {
-      for(var id in world.players) if(!world.players[id].st != READY) return;
-      return start_game(world);
+  [[CLIENT + COMMAND, READY], { 'state =': OK }], function(player) {
+    if (player.st != READY) {
+      player.update({ st: READY });
+      player.events.emit('ready');
     }
   },
 
@@ -655,16 +782,14 @@ var PROCESS_MESSAGE = match (
 );
 
 /**
- *  COLLISSION_RESOLVER
  *  Resolvs collision between two entities
  */
 var COLLISSION_RESOLVER = match (
 
-  //
-  // Check collission between Ship and Bullet
-  //
+  /**
+   *  Check collission between Ship and Bullet
+   */
   [Ship, Bullet, Array], function(ship, bullet, trash) {  
-    sys.debug('bullet collide with?');
     if (ship[SHIELD]) {
       trash.push(bullet);
     } else if (ship.id != bullet.oid) {
@@ -677,9 +802,9 @@ var COLLISSION_RESOLVER = match (
     return COLLISSION_RESOLVER([ship, bullet, trash]);
   },
 
-  //
-  // Check collission between Ship and Wall
-  //
+  /**
+   * Check collission between Ship and Wall 
+   */
   [Ship, Wall, Array], function(ship, wall, trash) {
     if (ship[SHIELD]) {
       if (wall.w > wall.h) {
@@ -697,16 +822,16 @@ var COLLISSION_RESOLVER = match (
     }
   },
 
-  //
-  // Check collission between Bullet and Wall
-  //
+  /**
+   * Check collission between Bullet and Wall 
+   */
   [Bullet, Wall, Array], function(bullet, wall, trash) {
     trash.push(bullet);
   },
 
-  //
-  // Check collission between Ship and Ship
-  //
+  /**
+   * Check collission between Ship and Ship 
+   */
   [Ship, Ship, Array], function(ship_a, ship_b, trash) {
     if (!ship_a[SHIELD] && !ship_b[SHIELD]) {
       ship_a.player.die(DEATH_CAUSE_SUICDE);
@@ -724,11 +849,11 @@ var COLLISSION_RESOLVER = match (
       });
     } else {
       if (!ship_a[SHIELD]) {
-        ship_a.player.die(DEATH_CAUSE_KILLED, ship_b);
+        ship_a.player.die(DEATH_CAUSE_KILLED, ship_b.player);
         trash.push(ship_a);
       } 
       if (!ship_b[SHIELD]) {
-        ship_b.player.die(DEATH_CAUSE_KILLED, ship_a);
+        ship_b.player.die(DEATH_CAUSE_KILLED, ship_a.player);
         trash.push(ship_b);
       } 
     }
@@ -786,9 +911,9 @@ Player.prototype.spawn_ship = function(pos) {
   });
   entity.player = this;
   this.is_dead = false;
+  this.events.emit('spawn', entity);
   this.update({ eid: entity.id });
   this.entity = entity;
-  this.events.emit('spawn', entity);
   return entity;
 }
 
@@ -801,7 +926,7 @@ Player.prototype.spawn_ship = function(pos) {
 Player.prototype.die = function(death_cause, killed_by) {
   this.is_dead = true;
   this.entity = null;
-  this.events.emit('dead', death_cause, killed_by ? killed_by.id : -1);
+  this.events.emit('dead', death_cause, killed_by);
 }
 
 /**
@@ -816,7 +941,16 @@ Player.prototype.spawn_bullet = function() {
 }
 
 /**
+ *  Is called upon before init.
+ *  @return {undefined} Nothing
+ */
+World.prototype.before_init = function() {
+  this.entity_count = 1;
+}
+
+/**
  *  Find's a position to respawn on. 
+ *  @return {x, y} A point to a location where it's safe to spawn.
  */
 World.prototype.find_respawn_pos = function() {
   var bounds = { x: 0, y: 0, w: 60, h: 60};
@@ -834,16 +968,8 @@ World.prototype.find_respawn_pos = function() {
 }
 
 /**
- *  method World.prototype.before_init
- *  Is called upon before init.
- */
-World.prototype.before_init = function() {
-  this.entity_count = 1;
-}
-
-/**
- *  method World.prototype.build
- *  Is called when World is ready to be built.
+ *  Builds the world
+ *  @return {undefined} Nothing
  */
 World.prototype.build = function() {
   this.spawn_entity('wall', {
@@ -858,16 +984,6 @@ World.prototype.build = function() {
   this.spawn_entity('wall', {
     x: 0, y: 0, w: 10, h: this.h + 10, o: 'w'
   });
-}
-
-/**
- *  Returns a random value from an array.
- *  @param {Array} src Source array.
- *  @return {Object} The value
- */
-function get_random_value(src) {
-  var no = Math.floor(Math.random()*src.length);
-  return src[no];
 }
 
 /**
@@ -951,6 +1067,28 @@ function get_rules(options) {
   }
   return rules; 
 }
+
+/**
+ *  Returns a random value from an array and discards values that is already
+ *  picked. 
+ *  @param {Array} src Source array.
+ *  @param {Array} list An array that contains objects that already has been  
+                        assigned a value.
+ *  @param {String} prop_name The name of the property to check against. 
+ *  @return {Object} The value
+ */
+function get_random_value(src, list, prop_name) {
+  var value = null, count = 0;
+  while (!value && count++ <= src.length) {
+    value = src[Math.floor(Math.random() * src.length)];
+    src.forEach(function(item){
+      if (item[prop_name] == value) value = null;
+    });
+    if (value) return value;
+  }
+  return src[0];
+}
+
 
 /**
  *  Parses and returns server options from ARGV.

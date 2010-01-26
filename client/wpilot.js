@@ -6,33 +6,29 @@
 //  
 //  Copyright (c) 2010 Johan Dahlberg 
 //
-var CLIENT_VERSION = '0.5.1';
+var CLIENT_VERSION = '(develop version)';
 
-// Keyboard Constants
-var BACK                = 'back',
-    ROTATE_W            = 'ccw',
-    ROTATE_E            = 'cw',
-    TOGGLE_FPS          = 'toggle_fps',
-    TOGGLE_POS          = 'toggle_pos',
-    TOGGLE_FLOCK        = 'toggle_flock';
+var _ = Match.incl;
 
 var GRID_CELL_SIZE      = 250;
     GRID_CELL_COLOR     = 'rgba(255,255,255,0.2)';
     
-var _ = Match.incl;
-
 // GUI Fonts used in the client.
 var HUD_SMALL_FONT      = 'bold 9px Arial',
     HUD_LARGE_FONT      = 'bold 11px Arial',
+    HUD_XLARGE_FONT      = 'bold 16px Arial',
     HUD_WHITE_COLOR     = 'rgba(255,255,255,0.8)',
     HUD_GREY_COLOR      = 'rgba(255,255,255,0.4)';
-
+    HUD_MESSAGE_SMALL   = 0,
+    HUD_MESSAGE_LARGE   = 1;
 
 // Message log related constants.
 var LOG_AGE_LIMIT       = 100,
     LOG_HISTORY_COUNT   = 20,
     LOG_FONT            = '9px Arial',
     LOG_COLOR           = 'rgba(255,255,255,0.4)';
+
+var SHIP_FONT           = '9px Arial';
 
 // WPilotClient states
 var CLIENT_DISCONNECTED     = 0,
@@ -58,28 +54,13 @@ var DEFAULT_OPTIONS         = {
   log_console:          true,
   
   bindings: {
-    'ready':            114,
+    'ready':            82,
     'rotate_west':      37,
     'rotate_east':      39,
     'thrust':           38,
     'shoot':            32,
     'shield':           40
   }
-}
-
-// Keyboard bindings
-var KEYBOARD_BINDINGS = {
-  27:         BACK,           // Trigger: ESC
-  
-  37:         ROTATE_W,       // Trigger: Left arrow
-  39:         ROTATE_E,       // Trigger: Right arrow
-  38:         THRUST,         // Trigger: Up arrow
-  32:         SHOOT,          // Trigger: Space
-  40:         SHIELD,         // Trigger: Down arrow
-
-  49:         TOGGLE_FPS,     // Trigger: f
-  50:         TOGGLE_POS,     // Trigger: p
-  51:         TOGGLE_FLOCK    // Trigger: l
 }
 
 /**
@@ -95,7 +76,8 @@ function WPilotClient(options) {
   this.conn               = null;
   this.message_log        = [];
   this.hud_message        = null;
-  this.hud_message_alpha  = 0.2;
+  this.hud_message_type   = HUD_MESSAGE_SMALL;
+  this.respawn_at         = 0;
 
   this.netstat            = { 
     start_time:         null,
@@ -161,6 +143,9 @@ WPilotClient.prototype.set_viewport = function(viewport) {
   var self = this;
   viewport.ondraw = function() {
     if (self.state == CLIENT_CONNECTED) {
+      if (self.player.entity) {
+        viewport.set_camera_pos(self.player.entity);
+      }
       self.world.draw(viewport);
       self.draw_hud();
     }
@@ -215,7 +200,7 @@ WPilotClient.prototype.set_state = function(state) {
     case CLIENT_CONNECTED:
       this.log('Joined server ' + this.conn.URL + '...');
       this.hud_message = 'Waiting for more players to connect';
-      this.post([PLAYER + HANDSHAKE]);  
+      this.post([CLIENT + HANDSHAKE]);  
       break;
       
     case CLIENT_DISCONNECTED:    
@@ -242,13 +227,17 @@ WPilotClient.prototype.set_state = function(state) {
 WPilotClient.prototype.process_user_input = function(t, dt) {
   var player        = this.player,
       input        = this.input;
-  
+
   player.update({
-    't': input.on(THRUST),
-    'r': input.on(ROTATE_E) ? 1 : input.on(ROTATE_W) ? 2 : 0,
-    'sh': input.on(SHOOT),
-    'sd': input.on(SHIELD)
+    't': input.on('thrust'),
+    'r': input.on('rotate_east') ? 1 : input.on('rotate_west') ? 2 : 0,
+    'sh': input.on('shoot'),
+    'sd': input.on('shield')
   });
+  
+  if (input.toggle('ready')) {
+    this.post([CLIENT + COMMAND, READY]);
+  }
 
   if (player.is_changed('actions')) {
     var fields = player.changed_fields_in('actions');
@@ -289,7 +278,8 @@ WPilotClient.prototype.start_gameloop = function(initial_tick) {
   
   // Is called when loop is about to start over.
   gameloop.ondone = function(t, dt, alpha) {
-    self.update_netstat();
+    self.update_client(t, dt);
+    self.update_netstat(t, dt);
     viewport.refresh(alpha);
   }
 
@@ -459,8 +449,9 @@ WPilotClient.prototype.draw_hud = function() {
     ctx.font = HUD_SMALL_FONT;
     
     if(opt.hud_player_score_v) {
+      var limit = this.world.r_state == 'waiting' ? '-' : this.server_state.rules.round_limit;
       ctx.fillStyle = HUD_GREY_COLOR;
-      draw_label(ctx, center_w + 72, center_h + 55, 'Score: ' + this.player.s, 'right', 45);
+      draw_label(ctx, center_w + 72, center_h + 55, 'Score: ' + this.player.s + '/' + limit, 'right', 45);
     }
 
     if (opt.hud_player_name_v) {
@@ -469,7 +460,7 @@ WPilotClient.prototype.draw_hud = function() {
     }
 
     if (opt.hud_player_pos_v) {
-      var my_pos = '1';
+      var my_pos = this.player.pos;
       var max_pos = this.server_state.no_players;
       ctx.fillStyle = HUD_WHITE_COLOR;
       draw_label(ctx, center_w + 72, center_h - 45, 'Pos ' + my_pos + '/' + max_pos, 'right', 45);
@@ -484,19 +475,95 @@ WPilotClient.prototype.draw_hud = function() {
       draw_v_bar(ctx, center_w + 62, center_h - 37, 7, 78, this.player.e);
     }
     
+    ctx.save();
+    ctx.translate(center_w, center_h);
+    player_entity.draw(ctx);
+    ctx.restore();
+    
   }
 
-  ctx.font = HUD_LARGE_FONT;
   
   // Draw HUD message
   // Fixme: Find a better way to cycle between alpha values
   if (this.hud_message) {
-    var alpha = Math.abs(Math.sin((this.hud_message_alpha += 0.08)));
-    if (alpha < 0.1) alpha = 0.1;
-    ctx.fillStyle = 'rgba(255, 215,0,' + alpha + ')';
-    draw_label(ctx, center_w, viewport.h - 50, this.hud_message, 'center', 100);
+    ctx.fillStyle = 'rgb(255, 215, 0)';
+    if (this.hud_message_type == HUD_MESSAGE_LARGE) {
+      ctx.font = HUD_XLARGE_FONT;
+      draw_label(ctx, center_w, center_h, this.hud_message, 'center', 400);
+    } else {
+      ctx.font = HUD_LARGE_FONT;
+      draw_label(ctx, center_w, viewport.h - 50, this.hud_message, 'center', 100);
+    }
   }
 
+}
+
+WPilotClient.prototype.update_client = function(t, dt) {
+  var world   = this.world,
+      player  = this.player,
+      server  = this.server_state,
+      no      = 0,
+      sec     = dt * 60;
+  
+  switch(world.r_state) {
+    case 'waiting':
+      this.hud_message_type = HUD_MESSAGE_SMALL;
+      if (server.no_players == 1) {
+        this.hud_message = 'Waiting for more players to join...';
+      } else if (player.st != READY) {
+        this.hud_message = 'Press (r) when ready';
+      } else {
+        no = Math.ceil((server.no_players * 0.6) - server.no_ready_players);
+        this.hud_message = 'Waiting for ' + no + ' player' + (no == 1 ? '' : 's') + ' to press ready';
+      }
+      break;
+
+    case 'starting':
+      server.no_ready_players = 0;
+      no = parseInt((world.r_start_at - t) / sec);
+      this.hud_message_type = HUD_MESSAGE_LARGE;
+      if (no == 0) {
+        this.hud_message = 'Prepare your self...';
+      } else {
+        this.hud_message = 'Round starts in ' + no + ' sec';
+      }
+      break;
+
+    case 'running':
+      if (!player.entity) {
+        if (!this.respawn_at) {
+          this.respawn_at = t + server.rules.respawn_time * dt;
+        } 
+        no = parseInt((this.respawn_at - t) / sec); 
+        this.hud_message_type = HUD_MESSAGE_SMALL;
+        if (no == 0) {
+          this.hud_message = 'Prepare your self...';
+        } else {
+          this.hud_message = 'Respawn in ' + no + ' sec';
+        }
+      } else {
+        this.hud_message = '';
+      }
+      break;
+
+    case 'finished':
+      if (!world.winners) {
+        var winners = [];
+        for (var i = 0; i < world.r_winners.length; i++) {
+          winners.push(world.players[world.r_winners[i]].name);
+        }
+        world.winners = winners.join(',');
+      }
+      this.hud_message_type = HUD_MESSAGE_LARGE;
+      no = parseInt((world.r_restart_at - t) / sec);
+      if (no == 0) {
+        this.hud_message = 'Starting warm-up round';
+      } else {
+        this.hud_message = 'Round won by ' + world.winners  + '. New round starts in ' + no + ' sec';
+      }
+      break;
+    
+  }
 }
 
 /**
@@ -523,37 +590,31 @@ WPilotClient.prototype.update_netstat = function() {
   }
 }
 
-
-
 /**
  *  Represents a keyboard device. 
  *  @param {DOMElement} target The element to read input from.
- *  @param {Object} bindings A dict with keycode bindings.
+ *  @param {Object} options Options with .bindings
  */
-function Keyboard(target, bindings) {
+function Keyboard(target, options) {
+  var key_states = this.key_states = {};
   this.target = target;
-  var state = this.state = {};
+  this.bindings = options.bindings
   
-  for (var key in bindings) {
-    this.state[bindings[key]] = 0;
-  } 
-  
-  function get_name(e) {
-    if (bindings[e.keyCode]) return bindings[e.keyCode];
-    if (!name && e.shiftKey) return bindings['<shift>'];
-    if (!name && e.ctrlKey) return bindings['<ctrl>'];
-    if (!name && e.altKey) return bindings['<alt>'];
-    if (!name && e.metaKey) return bindings['<meta>'];
+  for (var i=16; i < 128; i++) {
+    key_states[i] = 0;
   }
-
-  target.onkeydown = function(event) {
-    var name = get_name(event);
-    if(name) state[name] = 1;
+  
+  key_states['shift'] = 0;
+  key_states['ctrl'] = 0;
+  key_states['alt'] = 0;
+  key_states['meta'] = 0;
+  
+  target.onkeydown = function(e) {
+    if(key_states[e.keyCode] == 0) key_states[e.keyCode] = 1;
   };
 
-  target.onkeyup = function(event) {
-    var name = get_name(event);
-    if(name) state[name] = 0;
+  target.onkeyup = function(e) {
+    if(key_states[e.keyCode] == 1) key_states[e.keyCode] = 0;
   };
 }
 
@@ -563,7 +624,8 @@ function Keyboard(target, bindings) {
  *  @return {NUmber} 1 if down else 0.
  */
 Keyboard.prototype.on = function(name) {
-  return this.state[name];
+  var key = this.bindings[name];
+  return this.key_states[key];
 }
 
 /**
@@ -573,8 +635,9 @@ Keyboard.prototype.on = function(name) {
  *  @return {NUmber} 1 if down else 0.
  */
 Keyboard.prototype.toggle = function(name) {
-  if (this.state[name]) {
-    this.state[name] = 0;
+  var key = this.bindings[name];
+  if (this.key_states[key]) {
+    this.key_states[key] = 0;
     return 1;
   }
   return 0;
@@ -779,17 +842,24 @@ var PROCESS_MESSAGE = Match (
   [[PLAYER + STATE, Number, Object], _],
   function(id, data, client) {
     var world = client.world,
-        player = world.players[id];
+        player = world.players[id],
+        player_pos = client.server_state.no_players;
     if (player) {
       player.update(data);
       player.commit();
+      world.each('players', function(opponent) {
+        if (client.player.s > opponent.s) {
+          player_pos--;
+        }
+      });
+      client.player.pos = player_pos;
       if (data.eid) {
         var entity = world.find(data.eid);
         player.entity = entity;
         if (player.is_me) {
           entity.is_me = true;
+          client.respawn_at = 0;
           client.viewport.set_camera_pos(entity);
-          client.hud_message = 'Waiting for more players to join..';
         }
       }
     }
@@ -804,28 +874,37 @@ var PROCESS_MESSAGE = Match (
         killer  = client.world.players[killer_id],
         text    = '';
     
-    player.entity = null;
-    
-    if (player.is_me) {
-      if (death_cause == DEATH_CAUSE_KILLED) {
-        text = 'You where killed by ' + killer.name;
+    if (player) {
+      if (player.is_me) {
+        if (death_cause == DEATH_CAUSE_KILLED) {
+          text = 'You where killed by ' + killer.name;
+        } else {
+          text = 'You took your own life, you suck!';
+        }
       } else {
-        text = 'You took your own life, you suck!';
+        if (death_cause == DEATH_CAUSE_KILLED) {
+          if (killer.is_me) {
+            // This is a temporary solution to player score. When game rules are
+            // in place, server will handle this.
+            killer.s++;
+          } 
+          text = player.name + ' was killed by ' + (killer.is_me ? 'you' : killer.name) + '.';
+        } else {
+          text = player.name + ' killed him self.';
+        }
       }
-      client.hud_message = 'Relax, you will respawn soon';
-    } else {
-      if (death_cause == DEATH_CAUSE_KILLED) {
-        if (killer.is_me) {
-          // This is a temporary solution to player score. When game rules are
-          // in place, server will handle this.
-          killer.s++;
-        } 
-        text = player.name + ' was killed by' + (killer.is_me ? 'you' : killer.name) + '.';
-      } else {
-        text = player.name + ' killed him self.';
-      }
+      client.log(text);      
     }
-    client.log(text);
+  },
+
+  /**
+   * Is recived when a player is ready
+   */
+  [[PLAYER + READY, Number], _], 
+  function(player_id, client) {
+    var player = client.world.players[player_id];
+    client.log(player.is_me ? 'You are now ready' : 'Player "' + player.name + ' is ready');
+    client.server_state.no_ready_players++;
   },
   
   /**
@@ -837,6 +916,19 @@ var PROCESS_MESSAGE = Match (
     client.log('Player "' + player.name + ' disconnected. Reason: ' + reason);
     delete client.world.players[player_id];
     client.server_state.no_players--;
+    if (client.world.round_state == 'waiting') {
+      client.server_state.no_ready_players--;
+    }
+  },
+  
+  /**
+   * Is recived when world state changes.
+   */
+  [[WORLD + STATE, Object], _], 
+  function(state, client) {
+    console.log(state);
+    client.world.update(state);
+    client.world.winners = null;
   },
 
   /**
@@ -886,6 +978,10 @@ var PROCESS_MESSAGE = Match (
    */
   [[ENTITY + DESTROY, Number], _],
   function(entity_id,  client) {
+    var entity = client.world.find(entity_id);
+    if (entity && entity.player) {
+      entity.player.entity = null;
+    }
     client.world.delete_by_id(entity_id);
   },
 
@@ -902,7 +998,9 @@ var PROCESS_MESSAGE = Match (
 );
 
 Player.prototype.before_init = function() {
+  this.pos = 1;
   this.is_me = false;
+  this.winners = null;
 }
 
 /**
@@ -916,10 +1014,7 @@ World.prototype.draw = function(viewport, alpha) {
   this.draw_grid(ctx, camera);
   for (var id in entities) {
     var entity = entities[id], pos = { x: entity.x, y: entity.y };
-    if (intersects(entity, camera)) {
-      if (entity.is_me) {
-        viewport.set_camera_pos(entity);
-      }
+    if (!entity.is_me && intersects(entity, camera)) {
       var point = viewport.translate(pos);
       ctx.save();
       ctx.translate(point.x, point.y);
@@ -995,6 +1090,7 @@ World.prototype.draw_grid = function(ctx, camera) {
 Ship.prototype.before_init = function() {
   this.visible = true;
   this.is_me = false;
+  this.position_lights_alpha = 0.3;
   this.shield_pulse_alpha = 0.3;
   this.player = null;
 }
@@ -1014,6 +1110,27 @@ Ship.prototype.draw = function(ctx) {
   ctx.lineTo(-(this.w / 2), (this.h / 2));
   ctx.lineTo(0, -(this.h / 2));
   ctx.fill();
+  //posistion lights
+  var pos_alpha = Math.abs(Math.sin((this.position_lights_alpha += 0.06)));
+  ctx.beginPath();
+  ctx.fillStyle = 'rgba(' + this.player.color + ',' + pos_alpha +')';
+  ctx.arc(this.w / 2, this.h / 2,1,0, 2*Math.PI,true)
+  ctx.fill();
+  ctx.beginPath();
+  ctx.fillStyle = 'rgba(' + this.player.color + ',' + pos_alpha +')';
+  ctx.arc(-(this.w / 2), this.h / 2,1,0, 2* Math.PI,true)
+  ctx.fill();
+  //ship window
+  ctx.beginPath();
+  ctx.fillStyle = 'rgb(' + this.player.color + ')';
+  ctx.arc(0,0,2,0, Math.PI,true)
+  ctx.fill();
+  if(!this.is_me){  
+    ctx.rotate(-this.a);
+    ctx.font = SHIP_FONT;
+  	ctx.fillStyle = 'rgb(' + this.player.color + ')';
+    draw_label(ctx, 0, this.h + 10, this.player.name, 'center', 100);	
+  }
   if (this.sd) {
     ctx.beginPath();
     var alpha = Math.abs(Math.sin((this.shield_pulse_alpha += 0.06)));
